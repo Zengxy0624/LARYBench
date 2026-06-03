@@ -10,6 +10,7 @@ import random
 from pathlib import Path
 from typing import Optional, List, Union, Dict
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -357,7 +358,8 @@ class LatentActionExtractor:
             collate_fn=collate_fn
         )
 
-        with torch.inference_mode():
+        with torch.inference_mode(), ThreadPoolExecutor(max_workers=self.config.num_workers) as save_pool:
+            save_futures = []
             for batch in tqdm(loader, desc=f"Partition {self.config.partition}"):
                 if batch is None:
                     continue
@@ -371,10 +373,16 @@ class LatentActionExtractor:
                 for i, global_idx in enumerate(batch_indices):
                     save_name = f"latent_action_{global_idx:08d}.npz"
                     save_path = os.path.join(output_dir, save_name)
-                    np.savez_compressed(save_path, tokens=batch_tokens[i], indices=batch_ids[i])
+                    # np.savez_compressed is CPU-bound on zlib, which releases the GIL,
+                    # so writing in a thread pool gives real parallel speedup.
+                    save_futures.append(save_pool.submit(
+                        np.savez_compressed, save_path, tokens=batch_tokens[i], indices=batch_ids[i]))
                     # Store relative path for portability
                     relative_path = os.path.join(self.config.dataset, self.config.split, self.config.model, save_name)
                     df.at[global_idx, 'la_path'] = relative_path
+
+            for f in save_futures:
+                f.result()
 
         return df
 
