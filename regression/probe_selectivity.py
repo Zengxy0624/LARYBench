@@ -96,6 +96,26 @@ def build_cache(dataset, n, seed, tag):
     return X, Y
 
 
+def load_or_build_pool(cache_dir, dataset, n, seed, tag):
+    """有 .npy 缓存就 mmap 只读(多进程共享 page cache、内存只一份);否则建池,
+    若给了 cache_dir 就落盘供后续进程 mmap。"""
+    if cache_dir:
+        xp = os.path.join(cache_dir, f'X_{tag}.npy')
+        yp = os.path.join(cache_dir, f'Y_{tag}.npy')
+        if os.path.exists(xp) and os.path.exists(yp):
+            X = torch.from_numpy(np.load(xp, mmap_mode='r'))
+            Y = torch.from_numpy(np.load(yp, mmap_mode='r'))
+            print(f"  [{tag}] mmap 共享缓存 {tuple(X.shape)} <- {xp}", flush=True)
+            return X, Y
+    X, Y = build_cache(dataset, n, seed, tag)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        np.save(os.path.join(cache_dir, f'X_{tag}.npy'), X.numpy())
+        np.save(os.path.join(cache_dir, f'Y_{tag}.npy'), Y.numpy())
+        print(f"  [{tag}] 已落盘缓存 -> {cache_dir}", flush=True)
+    return X, Y
+
+
 def per_dim_and_group_mse(pred, target, action_steps, dim_labels, group_idx):
     num = len(dim_labels)
     p = pred.view(-1, action_steps, num)
@@ -211,6 +231,7 @@ def summarize(jsonl, group_idx, out_path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--dataset', default='calvin')
+    ap.add_argument('--model', default=LA_MODEL, help='extract 产出的 VFM 名:dinov2-origin / dinov3-origin / ...')
     ap.add_argument('--stride', type=int, default=5)
     ap.add_argument('--ks', type=int, nargs='+', default=[2, 4, 8, 16, 32, 64, 128])
     ap.add_argument('--modes', nargs='+', default=['lowrank', 'random'])
@@ -230,14 +251,16 @@ def main():
     ap.add_argument('--blocks', type=int, default=2)
     ap.add_argument('--results-jsonl', default=None)
     ap.add_argument('--out', default=None)
+    ap.add_argument('--pool-cache', default=None, help='池 .npy 缓存目录;存在则 mmap 共享读,否则建并落盘')
+    ap.add_argument('--build-pool-only', action='store_true', help='只建池缓存后退出(供多卡进程随后 mmap)')
     args = ap.parse_args()
 
     assert args.dataset == 'calvin', "本探针先只接 calvin absolute"
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     root = os.environ['PROJECT_ROOT']
     data_dir = Path(root) / 'baselines' / 'lary' / 'data'
-    train_csv = str(data_dir / f"train_la_{args.dataset}_{args.stride}_{LA_MODEL}.csv")
-    val_csv = str(data_dir / f"val_la_{args.dataset}_{args.stride}_{LA_MODEL}.csv")
+    train_csv = str(data_dir / f"train_la_{args.dataset}_{args.stride}_{args.model}.csv")
+    val_csv = str(data_dir / f"val_la_{args.dataset}_{args.stride}_{args.model}.csv")
     log_dir = Path(os.environ.get('LARY_LOG_DIR', '.')) / 'regression'
     log_dir.mkdir(parents=True, exist_ok=True)
     jsonl = args.results_jsonl or str(log_dir / 'selectivity_results.jsonl')
@@ -258,11 +281,14 @@ def main():
     shape = tuple(raw.shape)
     print(f"[setup] feature tokens shape = {shape}", flush=True)
 
-    # 一次性建池(读盘) —— 训练池 + 固定验证池
+    # 一次性建池(读盘) —— 训练池 + 固定验证池;给了 --pool-cache 则 mmap 共享
     print(f"[cache] pool train n={args.n_pool_train} ...", flush=True)
-    Xpool, Ypool = build_cache(tr_ds, args.n_pool_train, 12345, 'train-pool')
+    Xpool, Ypool = load_or_build_pool(args.pool_cache, tr_ds, args.n_pool_train, 12345, 'train-pool')
     print(f"[cache] pool val n={args.n_pool_val} (固定验证集) ...", flush=True)
-    Xva, Yva = build_cache(va_ds, args.n_pool_val, 54321, 'val-pool')
+    Xva, Yva = load_or_build_pool(args.pool_cache, va_ds, args.n_pool_val, 54321, 'val-pool')
+    if args.build_pool_only:
+        print("[build-pool-only] 池缓存就绪,退出", flush=True)
+        return
     # 验证特征留 CPU(fp16),eval 时逐 batch 上 GPU,省 ~8GB 显存;只有小的 Yva 常驻 GPU
     Yva_d = Yva.to(device).float()
 
