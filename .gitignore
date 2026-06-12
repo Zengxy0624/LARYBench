@@ -2,3 +2,9 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+
+# Run artifacts
+wandb/
+
+# Generated feature manifests (extract 产物,可重生成)
+data/*_la_*.csv
