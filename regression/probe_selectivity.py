@@ -52,13 +52,19 @@ LA_MODEL = "dinov2-origin"
 class SelectivityProbe(nn.Module):
     """per-token 投影 (in_dim->k, 跨 token 共享) -> flatten -> MLPResNet。
     mode='full' 时跳过投影(k=in_dim),即未压缩基准(显存大,慎用)。"""
-    def __init__(self, n_frames, n_tokens, in_dim, k, out_dim, mode, hidden=4096, blocks=2):
+    def __init__(self, n_frames, n_tokens, in_dim, k, out_dim, mode, hidden=4096, blocks=2,
+                 sel_idx=None):
         super().__init__()
         self.n_frames, self.n_tokens, self.in_dim = n_frames, n_tokens, in_dim
         self.mode = mode
         if mode == 'full':
             self.proj = None
             flat_dim = n_frames * n_tokens * in_dim
+        elif mode == 'select':
+            # 硬选:gather 固定 k 个原始通道(投影=one-hot 行,无参数)
+            self.proj = None
+            self.register_buffer('sel_idx', torch.as_tensor(sel_idx, dtype=torch.long))
+            flat_dim = n_frames * n_tokens * len(sel_idx)
         else:
             self.proj = nn.Linear(in_dim, k, bias=False)
             if mode == 'random':
@@ -69,7 +75,10 @@ class SelectivityProbe(nn.Module):
 
     def forward(self, x):  # x: (B, n_frames*n_tokens*in_dim)
         B = x.shape[0]
-        if self.proj is not None:
+        if self.mode == 'select':
+            x = x.view(B, self.n_frames, self.n_tokens, self.in_dim)[..., self.sel_idx]
+            x = x.reshape(B, -1)
+        elif self.proj is not None:
             x = x.view(B, self.n_frames, self.n_tokens, self.in_dim)
             x = self.proj(x)
             x = x.reshape(B, -1)
